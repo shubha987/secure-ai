@@ -113,69 +113,100 @@ class SecurityScanner:
         try:
             # Execute the task
             if current_task["tool"] == "nmap":
-                result = self._run_nmap(current_task["params"])
+                command = f"nmap -v -sV -p- {current_task['params']['target']}"
+                result = run_command(command)
             elif current_task["tool"] == "gobuster":
-                result = self._run_gobuster(current_task["params"])
+                command = f"gobuster dir -u http://{current_task['params']['target']} -w /usr/share/wordlists/dirb/common.txt -t 50"
+                result = run_command(command)
             else:
                 raise ValueError(f"Unknown tool: {current_task['tool']}")
 
+            if not result or not result.get('output'):
+                raise ValueError(f"No output from {current_task['tool']}")
+
             current_task["result"] = result
             current_task["status"] = "completed"
+            current_task["command"] = command  # Store the command for reference
 
         except Exception as e:
             current_task["status"] = "failed"
+            current_task["error"] = str(e)
             state["errors"].append(f"Task execution failed: {str(e)}")
         
-        # Move to next task
         state["current_task_index"] += 1
         return state
 
     def _analyze_results(self, state: ScanState) -> ScanState:
         """Analyze all completed tasks results"""
         try:
+            scan_summary = []
+            for task in state["tasks"]:
+                if task["status"] == "completed" and task.get("result"):
+                    scan_summary.append(
+                        f"TOOL: {task['tool']}\n"
+                        f"TARGET: {task['params'].get('target', 'unknown')}\n"
+                        f"OUTPUT:\n{task['result'].get('output', '').strip()}"
+                    )
+
+            if not scan_summary:
+                raise ValueError("No scan results to analyze")
+
             analysis_prompt = ChatPromptTemplate.from_messages([
-                ("system", "You are a security expert. Analyze these scan results:"),
-                ("user", """Analyze the following security scan results:
+                ("system", "You are a security expert. Return only valid JSON with no additional text."),
+                ("user", """Analyze these scan results:
+
 {scan_results}
 
-Provide a security analysis in JSON format with the following structure:
+Response must be ONLY valid JSON in this exact format:
 {{
     "findings": [
         {{
-            "type": "finding_type",
-            "description": "detailed description",
-            "severity": "high/medium/low"
+            "type": "security_finding",
+            "description": "Description of the security finding",
+            "severity": "high|medium|low"
         }}
     ],
     "recommendations": [
-        "detailed recommendation 1",
-        "detailed recommendation 2"
+        "Action item to address findings"
     ],
-    "risk_assessment": "high/medium/low"
+    "risk_assessment": "high|medium|low"
 }}""")
             ])
 
-            # Prepare scan results summary
-            scan_results = []
-            for task in state["tasks"]:
-                if task["status"] == "completed" and task.get("result"):
-                    scan_results.append(
-                        f"Tool: {task['tool']}\n"
-                        f"Target: {task['params'].get('target', 'unknown')}\n"
-                        f"Output:\n{task['result'].get('output', '')}\n"
-                    )
+            # Configure LLM for strict JSON output
+            json_llm = self.llm.bind(
+                temperature=0,
+                max_tokens=500,
+                response_format={"type": "json_object"}
+            )
 
-            # Run analysis through LLM
-            analysis_chain = analysis_prompt | self.llm | JsonOutputParser()
+            # Run analysis
+            analysis_chain = analysis_prompt | json_llm | JsonOutputParser()
             analysis = analysis_chain.invoke({
-                "scan_results": "\n".join(scan_results)
+                "scan_results": "\n\n".join(scan_summary)
             })
-            
-            # Store analysis in state
+
+            # Set default if no findings
+            if not analysis.get("findings"):
+                analysis["findings"] = [{
+                    "type": "information",
+                    "description": "No significant security issues found",
+                    "severity": "low"
+                }]
+
             state["analysis"] = analysis
 
         except Exception as e:
             state["errors"].append(f"Analysis error: {str(e)}")
+            state["analysis"] = {
+                "findings": [{
+                    "type": "error",
+                    "description": "Failed to analyze scan results",
+                    "severity": "unknown"
+                }],
+                "recommendations": ["Manual security review recommended"],
+                "risk_assessment": "unknown"
+            }
 
         return state
 
@@ -186,7 +217,11 @@ Provide a security analysis in JSON format with the following structure:
 
     def _run_gobuster(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Execute gobuster scan"""
-        command = f"gobuster dir -u {params['target']} -w {params.get('wordlist', '/usr/share/wordlists/dirb/common.txt')}"
+        target = params['target']
+        if not target.startswith('http://') and not target.startswith('https://'):
+            target = f"https://{target}"
+        
+        command = f"gobuster dir -u {target} -w /usr/share/wordlists/dirb/common.txt -t 50"
         return run_command(command)
 
     def run_security_scan(self, instruction: str, target: str) -> Dict[str, Any]:
