@@ -1,35 +1,14 @@
-import subprocess
 import os
-import shlex
-import re
-from typing import Optional, Dict, Any, List
-from dataclasses import dataclass
-from datetime import datetime
+from typing import Dict, Any
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from langgraph.graph import StateGraph, END
-from typing import TypedDict, Annotated
-import json
 from dotenv import load_dotenv
+from tasks import ScanState, TaskInfo
+from utils import run_command
 
 load_dotenv()
-
-# Define state types
-class ScanState(TypedDict):
-    command: str
-    scan_result: Optional[Dict[str, Any]]
-    analysis: Optional[Dict[str, Any]]
-    errors: List[str]
-    current_node: str
-
-@dataclass
-class ScanResult:
-    timestamp: str
-    command: str
-    output: str
-    analysis: Optional[Dict[str, Any]] = None
-    error: Optional[str] = None
 
 class SecurityScanner:
     def __init__(self):
@@ -43,79 +22,75 @@ class SecurityScanner:
             temperature=0.2
         )
         
-        # Initialize workflow graph
         self.workflow = self._create_workflow()
-        
-        # Initialize other components
         self._setup_components()
 
     def _setup_components(self):
-        """Setup LangChain components"""
-        self.parser = JsonOutputParser(pydantic_object={
-            "type": "object",
-            "properties": {
-                "open_ports": {"type": "array"},
-                "vulnerabilities": {"type": "array"},
-                "recommendations": {"type": "array"},
-                "risk_level": {"type": "string"},
-                "summary": {"type": "string"}
-            }
-        })
-        
-        self.analysis_prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are a cybersecurity expert analyzing Nmap scan results."),
+        """Setup task planning and analysis components"""
+        self.task_planner_prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are a security testing planner. Break down security tasks into specific steps."),
             ("user", """
-            Analyze this Nmap scan:
-            Command: {command}
-            Timestamp: {timestamp}
-            Output: {output}
+            Create a detailed plan for this security testing instruction:
+            Instruction: {instruction}
+            Target: {target}
             
-            Provide a security analysis in JSON format with:
-            - open_ports: Array of detected open ports
-            - vulnerabilities: Array of potential vulnerabilities
-            - recommendations: Array of security recommendations
-            - risk_level: Overall risk assessment (Low/Medium/High)
-            - summary: Brief analysis summary
+            Break it down into specific tasks in JSON format:
+            {{
+                "tasks": [
+                    {{
+                        "tool": "tool_name",
+                        "params": {{"param1": "value1"}},
+                        "description": "task description"
+                    }}
+                ]
+            }}
+            
+            Available tools: nmap, gobuster
             """)
         ])
-        
-        self.analysis_chain = self.analysis_prompt | self.llm | self.parser
+
+        self.task_planner_chain = self.task_planner_prompt | self.llm | JsonOutputParser()
 
     def _create_workflow(self) -> StateGraph:
-        """Create the workflow graph"""
+        """Create the security testing workflow"""
         workflow = StateGraph(ScanState)
 
-        # Add nodes
-        workflow.add_node("validate", self.validate_nmap_command)
-        workflow.add_node("scan", self.run_nmap_command)
-        workflow.add_node("analyze", self.analyze_scan)
+        # Add nodes for each stage
+        workflow.add_node("plan", self._plan_tasks)
+        workflow.add_node("execute", self._execute_current_task)
+        workflow.add_node("analyze", self._analyze_results)
+        workflow.add_node("update", self._update_task_list)
 
-        # Define edge conditions as separate functions
-        def route_after_validate(state: ScanState) -> str:
+        # Define routing logic
+        def route_after_plan(state: ScanState) -> str:
+            return "execute" if state["tasks"] else END
+
+        def route_after_execute(state: ScanState) -> str:
             if state["errors"]:
-                return END
-            return "scan"
-
-        def route_after_scan(state: ScanState) -> str:
-            if state["errors"] or not state["scan_result"]:
                 return END
             return "analyze"
 
         def route_after_analyze(state: ScanState) -> str:
+            return "update"
+
+        def route_after_update(state: ScanState) -> str:
+            if state["current_task_index"] < len(state["tasks"]) - 1:
+                state["current_task_index"] += 1
+                return "execute"
             return END
 
-        # Add edges with routing functions
+        # Add conditional edges
         workflow.add_conditional_edges(
-            "validate",
-            route_after_validate,
+            "plan",
+            route_after_plan,
             {
-                "scan": "scan",
+                "execute": "execute",
                 END: END
             }
         )
         workflow.add_conditional_edges(
-            "scan",
-            route_after_scan,
+            "execute",
+            route_after_execute,
             {
                 "analyze": "analyze",
                 END: END
@@ -125,125 +100,197 @@ class SecurityScanner:
             "analyze",
             route_after_analyze,
             {
+                "update": "update"
+            }
+        )
+        workflow.add_conditional_edges(
+            "update",
+            route_after_update,
+            {
+                "execute": "execute",
                 END: END
             }
         )
 
-        # Set entry point
-        workflow.set_entry_point("validate")
-
+        workflow.set_entry_point("plan")
         return workflow.compile()
 
-    def handle_error(self, state: ScanState, error: Exception) -> ScanState:
-        """Handle errors in the workflow"""
-        state["errors"].append(str(error))
-        return state
-
-    def validate_nmap_command(self, state: ScanState) -> ScanState:
-        """Validate the Nmap command"""
-        state["current_node"] = "validate"
+    def _plan_tasks(self, state: ScanState) -> ScanState:
+        """Plan tasks based on high-level instruction"""
         try:
-            allowed_patterns = [
-                r'^nmap\s+(-[A-Za-z]+\s+)*[\w\.-]+$',
-                r'^nmap\s+-p\s*\d+(?:,\d+)*\s+[\w\.-]+$'
+            plan = self.task_planner_chain.invoke({
+                "instruction": state["instruction"],
+                "target": state["target"]
+            },{"recursion_limit": 100})
+            
+            state["tasks"] = [
+                TaskInfo(
+                    tool=task["tool"],
+                    params=task["params"],
+                    status="pending",
+                    result=None,
+                    retries=0
+                ) for task in plan["tasks"]
             ]
-            if not any(re.match(pattern, state["command"]) for pattern in allowed_patterns):
-                state["errors"].append("Invalid or potentially unsafe nmap command")
+            
         except Exception as e:
-            state["errors"].append(f"Validation error: {str(e)}")
+            state["errors"].append(f"Task planning error: {str(e)}")
+            
         return state
 
-    def run_nmap_command(self, state: ScanState) -> ScanState:
-        """Execute the Nmap command"""
-        state["current_node"] = "scan"
+    def _execute_current_task(self, state: ScanState) -> ScanState:
+        """Execute the current task"""
+        current_task = state["tasks"][state["current_task_index"]]
+        current_task["status"] = "running"
+
         try:
-            args = shlex.split(state["command"])
-            process = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                shell=False,
-                timeout=300
-            )
+            if current_task["tool"] == "nmap":
+                result = self._run_nmap(current_task["params"])
+            elif current_task["tool"] == "gobuster":
+                result = self._run_gobuster(current_task["params"])
+            else:
+                raise ValueError(f"Unknown tool: {current_task['tool']}")
+
+            current_task["result"] = result
+            current_task["status"] = "completed"
+
+        except Exception as e:
+            current_task["status"] = "failed"
+            if current_task["retries"] < 3:
+                current_task["retries"] += 1
+                current_task["status"] = "pending"
+            else:
+                state["errors"].append(f"Task execution failed: {str(e)}")
+
+        return state
+
+    def _run_nmap(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute nmap scan"""
+        command = f"nmap {params.get('flags', '-sV')} {params['target']}"
+        return run_command(command)
+
+    def _run_gobuster(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute gobuster scan"""
+        command = f"gobuster dir -u {params['target']} -w {params.get('wordlist', '/usr/share/wordlists/dirb/common.txt')}"
+        return run_command(command)
+
+    def _analyze_results(self, state: ScanState) -> ScanState:
+        """Analyze the results of the current task and identify new targets"""
+        current_task = state["tasks"][state["current_task_index"]]
+        
+        # Only analyze if the task completed successfully.
+        if current_task["status"] != "completed":
+            return state
             
-            state["scan_result"] = {
-                "timestamp": datetime.now().isoformat(),
-                "command": state["command"],
-                "output": process.stdout,
-                "error": process.stderr if process.returncode != 0 else None
-            }
-            
-            if process.returncode != 0:
-                state["errors"].append(f"Nmap command failed: {process.stderr}")
+        try:
+            # Create analysis prompt with escaped JSON structure
+            analysis_prompt = ChatPromptTemplate.from_messages([
+                ("system", "You are a security expert analyzing scan results."),
+                ("user", """
+                Analyze these {tool} scan results and provide insights in JSON format:
+                Tool: {tool}
+                Target: {target}
+                Output: {output}
                 
-        except Exception as e:
-            state["errors"].append(f"Scan error: {str(e)}")
+                Provide analysis in JSON format:
+                {{
+                    "findings": [
+                        {{
+                            "type": "finding_type",
+                            "description": "description",
+                            "severity": "low|medium|high"
+                        }}
+                    ],
+                    "new_targets": [],
+                    "recommendations": []
+                }}
+                """)
+            ])
             
-        return state
-
-    def analyze_scan(self, state: ScanState) -> ScanState:
-        """Analyze the scan results"""
-        state["current_node"] = "analyze"
-        try:
-            if state["scan_result"] and not state["errors"]:
-                analysis = self.analysis_chain.invoke({
-                    "command": state["scan_result"]["command"],
-                    "timestamp": state["scan_result"]["timestamp"],
-                    "output": state["scan_result"]["output"]
-                })
-                state["analysis"] = analysis
+            # Create analysis chain
+            analysis_chain = analysis_prompt | self.llm | JsonOutputParser()
+            
+            # Run analysis
+            analysis = analysis_chain.invoke({
+                "tool": current_task["tool"],
+                "target": state["target"],
+                "output": current_task["result"]["output"]
+            },{"recursion_limit": 100})
+            
+            # Update state with analysis
+            current_task["analysis"] = analysis
+            
+            # Add any new discovered targets
+            if "new_targets" in analysis:
+                state["discovered_targets"].extend([
+                    target for target in analysis["new_targets"]
+                    if target not in state["discovered_targets"]
+                ])
                 
         except Exception as e:
             state["errors"].append(f"Analysis error: {str(e)}")
             
         return state
 
-    def run_scan(self, command: str) -> Dict[str, Any]:
-        """Run the complete scanning workflow"""
+    def _update_task_list(self, state: ScanState) -> ScanState:
+        """Update task list based on analysis results"""
+        current_task = state["tasks"][state["current_task_index"]]
+        
+        if not current_task.get("analysis"):
+            return state
+            
+        try:
+            # For each discovered target in the current analysis,
+            # add a new task only if not already scheduled.
+            new_targets = current_task["analysis"].get("new_targets", [])
+            for target in new_targets:
+                # Skip if the target is the original one.
+                if target.lower() == state["target"].lower():
+                    continue
+                
+                # Check if a task for this target already exists.
+                already_scheduled = any(
+                    task["params"].get("target", "").lower() == target.lower()
+                    for task in state["tasks"]
+                )
+                if already_scheduled:
+                    continue
+
+                # Add new task based on the tool used in the current task.
+                if current_task["tool"] == "nmap":
+                    state["tasks"].append({
+                        "tool": "nmap",
+                        "params": {"target": target, "flags": "-sV"},
+                        "status": "pending",
+                        "result": None,
+                        "retries": 0
+                    })
+                elif current_task["tool"] == "gobuster":
+                    state["tasks"].append({
+                        "tool": "gobuster",
+                        "params": {"target": target},
+                        "status": "pending",
+                        "result": None,
+                        "retries": 0
+                    })
+                    
+        except Exception as e:
+            state["errors"].append(f"Task update error: {str(e)}")
+            
+        return state
+
+    def run_security_scan(self, instruction: str, target: str) -> Dict[str, Any]:
+        """Run the complete security scanning workflow"""
         initial_state = ScanState(
-            command=command,
-            scan_result=None,
-            analysis=None,
+            instruction=instruction,
+            target=target,
+            tasks=[],
+            current_task_index=0,
+            discovered_targets=[target],
             errors=[],
-            current_node="validate"
+            current_node="plan",
+            analysis=None
         )
         
-        final_state = self.workflow.invoke(initial_state)
+        final_state = self.workflow.invoke(initial_state,{"recursion_limit": 100})
         return final_state
-
-def main():
-    try:
-        scanner = SecurityScanner()
-        
-        print("Network Security Scanner (LangChain + LangGraph + Groq)")
-        print("=" * 50)
-        
-        command = input("Enter Nmap command (e.g., 'nmap -sV google.com'): ").strip()
-        
-        print("\nExecuting security workflow...")
-        result = scanner.run_scan(command)
-        
-        if result["errors"]:
-            print("\n=== Errors ===")
-            for error in result["errors"]:
-                print(f"- {error}")
-            return 1
-        
-        print("\n=== Scan Details ===")
-        print(f"Timestamp: {result['scan_result']['timestamp']}")
-        print(f"Command: {result['scan_result']['command']}")
-        
-        print("\n=== Scan Output ===")
-        print(result['scan_result']['output'])
-        
-        print("\n=== AI Analysis ===")
-        print(json.dumps(result['analysis'], indent=2))
-        
-    except Exception as e:
-        print(f"\nError: {str(e)}")
-        return 1
-    
-    return 0
-
-if __name__ == "__main__":
-    exit(main())
