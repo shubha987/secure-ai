@@ -139,60 +139,74 @@ class SecurityScanner:
     def _analyze_results(self, state: ScanState) -> ScanState:
         """Analyze all completed tasks results"""
         try:
+            # Format scan results
             scan_summary = []
             for task in state["tasks"]:
                 if task["status"] == "completed" and task.get("result"):
-                    scan_summary.append(
-                        f"TOOL: {task['tool']}\n"
-                        f"TARGET: {task['params'].get('target', 'unknown')}\n"
-                        f"OUTPUT:\n{task['result'].get('output', '').strip()}"
-                    )
+                    output = task['result'].get('output', '').strip()
+                    if task['tool'].lower() == 'nmap':
+                        # Extract relevant nmap info
+                        scan_summary.append(
+                            f"NMAP FINDINGS:\n"
+                            f"- Target: {task['params'].get('target')}\n"
+                            f"- Ports and Services:\n"
+                            "\n".join([line for line in output.split('\n') 
+                                     if any(x in line.lower() for x in ['port', 'open', 'service', 'version'])])
+                        )
+                    elif task['tool'].lower() == 'gobuster':
+                        scan_summary.append(
+                            f"DIRECTORY SCAN FINDINGS:\n"
+                            f"- Target: {task['params'].get('target')}\n"
+                            f"- Discovered Paths:\n{output}"
+                        )
 
-            if not scan_summary:
-                raise ValueError("No scan results to analyze")
-
+            # Create analysis prompt
             analysis_prompt = ChatPromptTemplate.from_messages([
-                ("system", "You are a security expert. Return only valid JSON with no additional text."),
-                ("user", """Analyze these scan results:
-
+                ("system", "You are a security expert. Analyze scan results and output ONLY valid JSON."),
+                ("user", """Given these security scan results:
 {scan_results}
 
-Response must be ONLY valid JSON in this exact format:
+Output ONLY a JSON object with this EXACT structure (no other text):
 {{
     "findings": [
         {{
-            "type": "security_finding",
-            "description": "Description of the security finding",
+            "type": "security_issue",
+            "description": "short description",
             "severity": "high|medium|low"
         }}
     ],
     "recommendations": [
-        "Action item to address findings"
+        "specific action item"
     ],
     "risk_assessment": "high|medium|low"
 }}""")
             ])
 
-            # Configure LLM for strict JSON output
+            # Configure LLM for JSON output
             json_llm = self.llm.bind(
                 temperature=0,
-                max_tokens=500,
+                max_tokens=1000,
                 response_format={"type": "json_object"}
             )
 
             # Run analysis
-            analysis_chain = analysis_prompt | json_llm | JsonOutputParser()
-            analysis = analysis_chain.invoke({
+            analysis = (analysis_prompt | json_llm | JsonOutputParser()).invoke({
                 "scan_results": "\n\n".join(scan_summary)
             })
 
-            # Set default if no findings
+            # Validate and normalize analysis
             if not analysis.get("findings"):
                 analysis["findings"] = [{
-                    "type": "information",
-                    "description": "No significant security issues found",
+                    "type": "scan_complete",
+                    "description": "No immediate security issues found",
                     "severity": "low"
                 }]
+
+            if not analysis.get("recommendations"):
+                analysis["recommendations"] = ["Continue regular security monitoring"]
+
+            if not analysis.get("risk_assessment"):
+                analysis["risk_assessment"] = "low"
 
             state["analysis"] = analysis
 
@@ -200,12 +214,15 @@ Response must be ONLY valid JSON in this exact format:
             state["errors"].append(f"Analysis error: {str(e)}")
             state["analysis"] = {
                 "findings": [{
-                    "type": "error",
-                    "description": "Failed to analyze scan results",
-                    "severity": "unknown"
+                    "type": "scan_analysis",
+                    "description": f"Analysis error: {str(e)}",
+                    "severity": "medium"
                 }],
-                "recommendations": ["Manual security review recommended"],
-                "risk_assessment": "unknown"
+                "recommendations": [
+                    "Review raw scan results manually",
+                    "Try running the scan again with different parameters"
+                ],
+                "risk_assessment": "medium"
             }
 
         return state
