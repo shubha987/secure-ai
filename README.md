@@ -54,7 +54,7 @@ Secure-AI leverages large language models to plan, execute, and analyze security
 Run a security scan using the CLI:
 ```sh
     cd src
-    python main.py"
+    python main.py
 ```
 The tool will:
 
