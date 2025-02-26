@@ -45,9 +45,9 @@ Secure-AI leverages large language models to plan, execute, and analyze security
 
 5. **Set up environment variables**
     Create a [.env](http://_vscodecontentref_/0) file in the project root and add your API key:
-    ```
+```sh
     GROQ_API_KEY=your_groq_api_key
-    ```
+```
 
 ## Usage
 
