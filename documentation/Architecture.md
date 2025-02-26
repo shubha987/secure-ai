@@ -69,7 +69,13 @@ When all tasks are complete:
 - Formats the output in a structured format
 
 ## Component Interaction Diagram
-User Request → SecurityScanner → LangGraph Workflow ↓ ┌────────┴────────┐ ↓ ↓ Plan Tasks → Execute Tasks → Analyze Results ↑ ↓ └────┘ (repeat for each task)
+```sh
+User Request → SecurityScanner → LangGraph
+ Workflow ↓ ┌────────┴────────┐ ↓ ↓ 
+Plan Tasks → Execute Tasks → Analyze Results ↑ ↓ 
+        └────┘ (repeat for each task)
+
+```
 
 ## Supported Security Tools
 
